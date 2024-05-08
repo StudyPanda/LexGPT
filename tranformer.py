@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 #initialise wandb project
 wandb.login()
-wandb.init(project='Bigram_Lex')
+wandb.init(project='Transformer2_Lex')
 
 #hyperparameters
 batch_size = 32 #how many sequences to process in parallel
@@ -16,6 +16,7 @@ learning_rate = 1e-2
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_interval = 300
 eval_iters = 200
+embed_dim = 32
 
 torch.manual_seed(54)
 
@@ -66,14 +67,23 @@ def estimate_loss():
   return out
 
 class BigramLanguageModel(nn.Module):
-  def __init__(self, vocab_size):
+  def __init__(self):
     super().__init__()
     #each embedding represents the logits for the next token
-    self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+    self.token_embedding_table = nn.Embedding(vocab_size, embed_dim)
+    self.position_embedding_table = nn.Embedding(block_size, embed_dim) 
+    self.lm_head = nn.Linear(embed_dim, vocab_size)
+
+
 
   def forward(self, idx, targets = None):
     #idx and targets are 2D tensors of size (B,T)
-    logits = self.token_embedding_table(idx) #(B,T,C)
+    B,T = idx.shape
+    token_embed = self.token_embedding_table(idx) #(B,T,C)
+    pos_embed = self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
+
+    x = token_embed + pos_embed #(B, T, C) positional embeddings get broadcaster across batch
+    logits = self.lm_head(x) # (B,T, vocab_size)
 
     if targets == None:
       loss = None
@@ -101,7 +111,7 @@ class BigramLanguageModel(nn.Module):
     return idx
   
 #initialise model and train
-model = BigramLanguageModel(vocab_size)
+model = BigramLanguageModel()
 model = model.to(device)
 
 #create pytorch optimizer
@@ -125,8 +135,8 @@ for iter in range(max_iters):
 
 #generate from model
 idx = torch.zeros((1,1), dtype = torch.long)
+idx[0] = len(itos)-1
 
-text = model.generate(idx, max_new_tokens=1000)[0].tolist()
-for i in range(10):
-  print(decode(text[i:(i+1)*100]))
+for i in range(5):
+  print(decode(model.generate(idx, max_new_tokens=block_size - 1)[0].tolist()))
 
