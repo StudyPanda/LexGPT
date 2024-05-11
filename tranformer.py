@@ -11,12 +11,13 @@ wandb.init(project='Transformer2_Lex')
 #hyperparameters
 batch_size = 32 #how many sequences to process in parallel
 block_size = 8 #max length of a sequence
-max_iters = 3000
-learning_rate = 1e-2
+max_iters = 5000
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_interval = 300
 eval_iters = 200
 embed_dim = 32
+num_heads = 4
 
 torch.manual_seed(54)
 
@@ -66,12 +67,56 @@ def estimate_loss():
   model.train()
   return out
 
-class BigramLanguageModel(nn.Module):
+class Head(nn.Module):
+  def __init__(self, head_dim):
+    super().__init__()
+    self.head_dim = head_dim
+    self.key = nn.Linear(embed_dim, head_dim, bias = False)
+    self.query = nn.Linear(embed_dim, head_dim, bias = False)
+    self.value = nn.Linear(embed_dim, head_dim, bias = False)
+    self.register_buffer('tril_mask', torch.tril(torch.ones(block_size, block_size))) 
+  
+  def forward(self, x):
+    B,T,C = x.shape #Channel is d_k, the dimension of head_space
+    k = self.key(x) #(B, T, head_space)
+    q = self.query(x) #(B, T, head_space)
+    v = self.value(x) #(B, T, head_space)
+
+    #well we want (B, T, T) weight vector, for each token in the sequence,
+    #we want to know for much attention it should pay to other tokens
+    #so therefore, attn = softmax(Q K.t)...
+    wei = q @ k.transpose(-2,-1)
+    wei = wei * self.head_dim**(-0.5)
+    wei = wei.masked_fill(self.tril_mask[:T,:T] ==0, float('-inf')) #(B, T , T)
+    wei = F.softmax(wei, dim = -1) #(B, T , T)
+
+    out = wei @ v
+    return out
+
+class MultiHead(nn.Module):
+  def __init__(self, num_heads):
+    super().__init__()
+    self.num_heads = num_heads
+    assert embed_dim % num_heads == 0, "Number of heads and embedding dimension incompatible"
+    self.head_dim = embed_dim // num_heads
+    self.heads = nn.ModuleList([Head(self.head_dim) for _ in range(num_heads)])
+    self.W_o = nn.Linear(num_heads * self.head_dim, embed_dim)
+
+
+  def forward(self, x):
+    head_outs = [Head(x) for Head in self.heads] #(B, T, head_dim) head_dim = embed_dim/num_heads
+    concatenated = torch.cat(head_outs, dim = -1) #concatenate outputs from heads by channel dimension
+    out = self.W_o(concatenated) #(B, T, embed_dim)
+    return out
+    
+  
+
+class TransformerDecoder(nn.Module):
   def __init__(self):
     super().__init__()
-    #each embedding represents the logits for the next token
     self.token_embedding_table = nn.Embedding(vocab_size, embed_dim)
-    self.position_embedding_table = nn.Embedding(block_size, embed_dim) 
+    self.position_embedding_table = nn.Embedding(block_size, embed_dim)
+    self.heads = MultiHead(num_heads)
     self.lm_head = nn.Linear(embed_dim, vocab_size)
 
 
@@ -83,6 +128,7 @@ class BigramLanguageModel(nn.Module):
     pos_embed = self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
 
     x = token_embed + pos_embed #(B, T, C) positional embeddings get broadcaster across batch
+    x = self.heads(x) #(B,T,C)
     logits = self.lm_head(x) # (B,T, vocab_size)
 
     if targets == None:
@@ -100,7 +146,8 @@ class BigramLanguageModel(nn.Module):
   def generate(self, idx, max_new_tokens):
     #take idx (B,T) and generate max_new_tokens more tokens in time dimension
     for _ in range(max_new_tokens):
-      logits, loss = self(idx)
+      idx_cond = idx[:,-block_size:]
+      logits, loss = self(idx_cond)
       logits = logits[:, -1, :]
       #apply softmax to get probability distribution
       probs = F.softmax(logits, dim = -1)
@@ -111,7 +158,7 @@ class BigramLanguageModel(nn.Module):
     return idx
   
 #initialise model and train
-model = BigramLanguageModel()
+model = TransformerDecoder()
 model = model.to(device)
 
 #create pytorch optimizer
@@ -135,8 +182,7 @@ for iter in range(max_iters):
 
 #generate from model
 idx = torch.zeros((1,1), dtype = torch.long)
-idx[0] = len(itos)-1
+#idx[0] = len(itos)-1
 
-for i in range(5):
-  print(decode(model.generate(idx, max_new_tokens=block_size - 1)[0].tolist()))
+print(decode(model.generate(idx, max_new_tokens=50)[0].tolist()))
 
