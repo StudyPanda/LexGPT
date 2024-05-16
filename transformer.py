@@ -1,26 +1,37 @@
 import wandb
+import os
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import yaml
+from dataloader import get_tokenizer, text, vocab_size
 
-#initialise wandb project
-wandb.login()
-wandb.init(project='Transformer2_Lex')
+def load_config(path):
+    with open(path, 'r') as file:
+        return yaml.safe_load(file)
 
-#hyperparameters
-batch_size = 32 #how many sequences to process in parallel
-block_size = 8 #max length of a sequence
-max_iters = 5000
-learning_rate = 1e-3
+config = load_config('config.yaml')
+
+
+#training hyperparameters
+batch_size = config['training']['batch_size'] #how many sequences to process in parallel
+block_size = config['training']['block_size'] #maxlength of a sequence 
+max_iters = config['training']['max_iters']
+learning_rate = config['training']['learning_rate']
+eval_interval = config['training']['eval_interval']
+eval_iters = config['training']['eval_iters']
+
+#model hyperparameters
+embed_dim = config['model']['embed_dim']
+num_heads = config['model']['num_heads']
+num_decoder_blocks = config['model']['num_decoder_blocks']
+dropout = config['model']['dropout']
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_interval = 300
-eval_iters = 200
-embed_dim = 32
-num_heads = 4
 
 torch.manual_seed(54)
-
+'''
 #import Lex podcast data
 file_name = 'Lex.csv'
 df = pd.read_csv(file_name)
@@ -52,20 +63,8 @@ def get_batch(split):
   y = torch.stack([data[i+1:i+block_size+1] for i in ix])
   x,y = x.to(device), y.to(device)
   return x, y
+'''
 
-@torch.no_grad()
-def estimate_loss():
-  out = {}
-  model.eval()
-  for split in ['train', 'val']:
-    losses = torch.zeros(eval_iters)
-    for iter in range(eval_iters):
-      x, y = get_batch(split)
-      logits, loss = model(x,y)
-      losses[iter] = loss
-    out[split] = losses.mean()
-  model.train()
-  return out
 
 class Head(nn.Module):
   def __init__(self, head_dim):
@@ -74,7 +73,8 @@ class Head(nn.Module):
     self.key = nn.Linear(embed_dim, head_dim, bias = False)
     self.query = nn.Linear(embed_dim, head_dim, bias = False)
     self.value = nn.Linear(embed_dim, head_dim, bias = False)
-    self.register_buffer('tril_mask', torch.tril(torch.ones(block_size, block_size))) 
+    self.register_buffer('tril_mask', torch.tril(torch.ones(block_size, block_size)))
+    self.dropout = nn.Dropout(dropout) 
   
   def forward(self, x):
     B,T,C = x.shape #Channel is d_k, the dimension of head_space
@@ -89,6 +89,7 @@ class Head(nn.Module):
     wei = wei * self.head_dim**(-0.5)
     wei = wei.masked_fill(self.tril_mask[:T,:T] ==0, float('-inf')) #(B, T , T)
     wei = F.softmax(wei, dim = -1) #(B, T , T)
+    wei = self.dropout(wei)
 
     out = wei @ v
     return out
@@ -101,22 +102,52 @@ class MultiHead(nn.Module):
     self.head_dim = embed_dim // num_heads
     self.heads = nn.ModuleList([Head(self.head_dim) for _ in range(num_heads)])
     self.W_o = nn.Linear(num_heads * self.head_dim, embed_dim)
+    self.dropout = nn.Dropout(dropout)
 
 
   def forward(self, x):
-    head_outs = [Head(x) for Head in self.heads] #(B, T, head_dim) head_dim = embed_dim/num_heads
+    head_outs = [head(x) for head in self.heads] #(B, T, head_dim) head_dim = embed_dim/num_heads
     concatenated = torch.cat(head_outs, dim = -1) #concatenate outputs from heads by channel dimension
     out = self.W_o(concatenated) #(B, T, embed_dim)
+    out = self.dropout(out)
     return out
+
+class FeedForward(nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.FF = nn.Sequential(
+      nn.Linear(embed_dim, 4 * embed_dim), #internal dimension of feed forward is 4*d_model
+      nn.ReLU(),
+      nn.Linear(4* embed_dim, embed_dim), #projection back into embed_dim similar to W_o
+      nn.Dropout(dropout)
+    )
     
+  def forward(self, x):
+    return self.FF(x)
+
+class Block(nn.Module):
+  def __init__(self, num_heads):
+    super().__init__()
+    self.heads = MultiHead(num_heads)
+    self.FF = FeedForward()
+    self.ln1 = nn.LayerNorm(embed_dim) #normalization happens to the embedding_dimension
+    self.ln2 = nn.LayerNorm(embed_dim) # (B,T) both act as batches and per token in normalized
+  
+  def forward(self, x):
+    #pre-norm formulation rather than as in original paper
+    x = x + self.heads(self.ln1(x))
+    x = x + self.FF(self.ln2(x))
+    return x
+
   
 
-class TransformerDecoder(nn.Module):
+class Transformer(nn.Module):
   def __init__(self):
     super().__init__()
     self.token_embedding_table = nn.Embedding(vocab_size, embed_dim)
     self.position_embedding_table = nn.Embedding(block_size, embed_dim)
-    self.heads = MultiHead(num_heads)
+    self.blocks = nn.Sequential(*[Block(num_heads) for _ in range(num_decoder_blocks)])
+    self.ln = nn.LayerNorm(embed_dim)
     self.lm_head = nn.Linear(embed_dim, vocab_size)
 
 
@@ -127,8 +158,9 @@ class TransformerDecoder(nn.Module):
     token_embed = self.token_embedding_table(idx) #(B,T,C)
     pos_embed = self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
 
-    x = token_embed + pos_embed #(B, T, C) positional embeddings get broadcaster across batch
-    x = self.heads(x) #(B,T,C)
+    x = token_embed + pos_embed #(B, T, C) positional embeddings get broadcasted across batch
+    x = self.blocks(x) #(B,T,C)
+    x = self.ln(x)
     logits = self.lm_head(x) # (B,T, vocab_size)
 
     if targets == None:
@@ -153,36 +185,5 @@ class TransformerDecoder(nn.Module):
       probs = F.softmax(logits, dim = -1)
       #sample from distribution
       idx_next = torch.multinomial(probs, num_samples = 1)
-
       idx = torch.cat((idx, idx_next), dim = 1) #(B, T+1)
     return idx
-  
-#initialise model and train
-model = TransformerDecoder()
-model = model.to(device)
-
-#create pytorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr = learning_rate)
-
-for iter in range(max_iters):
-  
-  #evaluate the loss on train and val set
-  if iter % eval_interval == 0:
-    losses = estimate_loss()
-    wandb.log(losses)
-    print(f"step {iter}, training loss is {losses['train']:.4f}, validation loss is {losses['val']:.4f}")
-
-  xb, yb = get_batch('train')
-
-  logits, loss = model(xb, yb)
-  optimizer.zero_grad(set_to_none = True)
-  loss.backward()
-  optimizer.step()
-
-
-#generate from model
-idx = torch.zeros((1,1), dtype = torch.long)
-#idx[0] = len(itos)-1
-
-print(decode(model.generate(idx, max_new_tokens=50)[0].tolist()))
-

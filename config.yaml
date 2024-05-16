@@ -1,0 +1,13 @@
+model:
+  embed_dim: 384
+  num_heads: 6
+  num_decoder_blocks: 6
+  dropout: 0.2
+
+training:
+  batch_size: 64
+  block_size: 256
+  max_iters: 8000
+  learning_rate: 0.0003
+  eval_interval: 500
+  eval_iters: 200
