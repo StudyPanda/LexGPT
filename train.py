@@ -74,6 +74,8 @@ wandb.init(project='Transformer2_Lex')
 model = Transformer()
 model = model.to(device)
 
+print(sum(p.numel() for  p in model.parameters())/1e6, 'M parameters')
+
 #create pytorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr = learning_rate)
 
@@ -114,7 +116,7 @@ else:
 for iter in range(start_epoch, max_iters):
   
   #evaluate the loss on train and val set
-  if iter % eval_interval == 0:
+  if iter % eval_interval == 0 or iter == (max_iters-1):
     losses = estimate_loss()
     wandb.log(losses)
     print(f"step {iter}, training loss is {losses['train']:.4f}, validation loss is {losses['val']:.4f}")

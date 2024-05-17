@@ -19,14 +19,15 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 checkpoint_path = 'checkpoint.pth'
 model = Transformer()
+model = model.to(device)
 
 load_checkpoint(checkpoint_path, model, None)
 
 #generate from model
-idx = torch.zeros((1,1), dtype = torch.long).to(device = device)
+idx = torch.zeros((1,1), dtype = torch.long).to(device)
 #idx[0] = len(itos)-1
 
 with open('output.txt', 'w') as file:
     
-    output = tokenizer.decode(model.generate(idx, max_new_tokens=200)[0].tolist())
+    output = tokenizer.decode(model.generate(idx, max_new_tokens=2000)[0].tolist())
     file.write(output)  # Write a string to the file
